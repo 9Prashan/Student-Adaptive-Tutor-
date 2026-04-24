@@ -2,8 +2,6 @@
 googleGenAIAPI.py
 -----------------
 Uses client.models.generate_content for ALL calls (text + image).
-This is the correct approach per the official google-genai SDK docs —
-chats.create() has limitations with multimodal content and history management.
 """
 
 import asyncio
@@ -22,19 +20,9 @@ class GoogleGenAIAPI:
         self.client = genai.Client(api_key=GOOGLE_API_KEY)
 
     async def chat_completion(self, model, messages, temperature, max_tokens):
-        """
-        Send a conversation to the Gemini API and return a response wrapper.
-        Uses generate_content for ALL calls — handles both text and images.
-
-        Accepts OpenAI-style messages:
-          [{"role": "system"|"user"|"assistant", "content": str | list}, ...]
-
-        Returns object with: response.choices[0].message["content"]
-        """
-
-        # ── 1. Build system instruction and contents list ──────────────────
+        # ── 1. Parse messages ──────────────────────────────────────────────
         system_instruction = None
-        contents = []   # list of types.Content
+        contents = []
 
         for msg in messages:
             role    = msg["role"]
@@ -44,24 +32,29 @@ class GoogleGenAIAPI:
                 system_instruction = content
                 continue
 
-            # Map OpenAI roles to Gemini roles
             gemini_role = "model" if role == "assistant" else "user"
             parts = self._build_parts(content)
-            contents.append(types.Content(role=gemini_role, parts=parts))
+            if parts:
+                contents.append(types.Content(role=gemini_role, parts=parts))
 
-        # ── 2. Build generation config ──────────────────────────────────────
-        config = types.GenerateContentConfig(
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-            system_instruction=system_instruction,
-        )
+        # Gemini requires conversation to start with a user turn
+        # and must alternate user/model. Fix if needed.
+        contents = self._fix_turn_order(contents)
 
-        # ── 3. Call API with retry + back-off ───────────────────────────────
+        # ── 2. Config ──────────────────────────────────────────────────────
+        config_kwargs = {
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+        }
+        if system_instruction:
+            config_kwargs["system_instruction"] = system_instruction
+
+        config = types.GenerateContentConfig(**config_kwargs)
+
+        # ── 3. Call with retry ─────────────────────────────────────────────
         for attempt in range(self.retries):
             try:
                 loop = asyncio.get_event_loop()
-
-                # Capture in local vars for the closure
                 _contents = contents
                 _config   = config
                 _model    = model
@@ -77,34 +70,32 @@ class GoogleGenAIAPI:
                 return _GeminiResponseWrapper(response.text)
 
             except Exception as e:
-                error_str   = str(e)
-                wait        = self._parse_retry_delay(error_str)
+                # Log the FULL error so it shows in Streamlit Cloud logs
+                print(f"[GoogleGenAI] Attempt {attempt+1}/{self.retries} "
+                      f"| Model: {model} | Error: {type(e).__name__}: {e}")
+
+                error_str = str(e)
+                wait = self._parse_retry_delay(error_str)
 
                 if wait:
-                    print(f"⏳ Rate limit — waiting {wait}s "
-                          f"(attempt {attempt + 1}/{self.retries})...")
+                    print(f"[GoogleGenAI] Rate limit — waiting {wait}s...")
                     await asyncio.sleep(wait)
                 elif attempt < self.retries - 1:
                     backoff = 2 ** attempt
-                    print(f"Error (attempt {attempt + 1}): {e} "
-                          f"— retrying in {backoff}s...")
                     await asyncio.sleep(backoff)
                 else:
-                    raise e
+                    # Raise with full message visible to Streamlit
+                    raise RuntimeError(
+                        f"Gemini API error after {self.retries} attempts.\n"
+                        f"Model: {model}\n"
+                        f"Error: {type(e).__name__}: {e}"
+                    ) from e
 
         raise RuntimeError("Max retries exceeded.")
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
     def _build_parts(self, content) -> list:
-        """
-        Convert OpenAI-style content into a list of Gemini Part objects.
-
-        str   → [Part(text=...)]
-        list  → each block converted:
-                  {"type":"text",  "text":"..."}
-                  {"type":"image", "source":{"type":"base64","media_type":"...","data":"..."}}
-        """
         if isinstance(content, str):
             return [types.Part.from_text(text=content)]
 
@@ -113,20 +104,59 @@ class GoogleGenAIAPI:
             for block in content:
                 btype = block.get("type")
                 if btype == "text":
-                    parts.append(types.Part.from_text(text=block["text"]))
+                    text = block.get("text", "")
+                    if text:
+                        parts.append(types.Part.from_text(text=text))
                 elif btype == "image":
-                    src = block["source"]
-                    if src["type"] == "base64":
-                        image_bytes = base64.b64decode(src["data"])
-                        parts.append(
-                            types.Part.from_bytes(
-                                data=image_bytes,
-                                mime_type=src["media_type"],
+                    src = block.get("source", {})
+                    if src.get("type") == "base64":
+                        try:
+                            image_bytes = base64.b64decode(src["data"])
+                            parts.append(
+                                types.Part.from_bytes(
+                                    data=image_bytes,
+                                    mime_type=src["media_type"],
+                                )
                             )
-                        )
+                        except Exception as ex:
+                            print(f"[GoogleGenAI] Image decode error: {ex}")
             return parts
 
         return [types.Part.from_text(text=str(content))]
+
+    @staticmethod
+    def _fix_turn_order(contents: list) -> list:
+        """
+        Gemini requires:
+        1. First turn must be 'user'
+        2. Turns must strictly alternate user/model
+        This fixes any violations by merging or removing bad turns.
+        """
+        if not contents:
+            return contents
+
+        fixed = []
+        for turn in contents:
+            if not fixed:
+                # First turn must be user
+                if turn.role == "user":
+                    fixed.append(turn)
+                # Skip model turns at the start
+            else:
+                last_role = fixed[-1].role
+                if turn.role != last_role:
+                    # Correct alternation — add it
+                    fixed.append(turn)
+                else:
+                    # Same role back-to-back — merge parts into last turn
+                    merged_parts = fixed[-1].parts + turn.parts
+                    fixed[-1] = types.Content(role=last_role, parts=merged_parts)
+
+        # Must end with a user turn (last turn drives the response)
+        while fixed and fixed[-1].role == "model":
+            fixed.pop()
+
+        return fixed
 
     @staticmethod
     def _parse_retry_delay(error_str: str):

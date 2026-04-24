@@ -1,8 +1,5 @@
 """
-EduBot.py
----------
-Synchronous Bot class for Streamlit.
-Uses asyncio.run() internally so Streamlit can call sync methods.
+EduBot.py — Synchronous Bot class for Streamlit.
 """
 
 import asyncio
@@ -12,6 +9,10 @@ from prompts import (
     translator_sys_prompt, translator_prompt,
     format_content_sys_prompt, format_content_prompt,
 )
+
+# Use one reliable model for everything
+TEXT_MODEL   = "gemini-2.5-flash"
+VISION_MODEL = "gemini-2.5-flash"
 
 
 class Bot:
@@ -35,12 +36,19 @@ class Bot:
             {"role": "user",   "content": bot_prompt(problem=problem, solution=solution)},
         ]
 
-    # ── Internal async implementations ────────────────────────────────────
+    # ── Internal async ─────────────────────────────────────────────────────
 
     async def _get_response(self, messages: list) -> str:
-        # gemini-3-flash-preview handles both text and images natively
+        # Pick vision model if any message has an image
+        has_image = any(
+            isinstance(m.get("content"), list) and
+            any(b.get("type") == "image" for b in m["content"])
+            for m in messages
+        )
+        model = VISION_MODEL if has_image else TEXT_MODEL
+
         completion = await self.llm.chat_completion(
-            model="gemini-3-flash-preview",
+            model=model,
             messages=messages,
             temperature=0,
             max_tokens=1024,
@@ -48,26 +56,24 @@ class Bot:
         return completion.choices[0].message["content"]
 
     async def _translate(self, content: str, lang: str) -> str:
-        messages = [
-            {"role": "system", "content": translator_sys_prompt},
-            {"role": "user",   "content": translator_prompt(content=content, lang=lang)},
-        ]
         res = await self.llm.chat_completion(
-            model="gemini-2.5-flash-lite",
-            messages=messages,
+            model=TEXT_MODEL,
+            messages=[
+                {"role": "system", "content": translator_sys_prompt},
+                {"role": "user",   "content": translator_prompt(content=content, lang=lang)},
+            ],
             temperature=0,
             max_tokens=512,
         )
         return res.choices[0].message["content"]
 
     async def _format_content(self, content: str) -> str:
-        messages = [
-            {"role": "system", "content": format_content_sys_prompt},
-            {"role": "user",   "content": format_content_prompt(content=content)},
-        ]
         res = await self.llm.chat_completion(
-            model="gemini-2.5-flash-lite",
-            messages=messages,
+            model=TEXT_MODEL,
+            messages=[
+                {"role": "system", "content": format_content_sys_prompt},
+                {"role": "user",   "content": format_content_prompt(content=content)},
+            ],
             temperature=0,
             max_tokens=512,
         )
